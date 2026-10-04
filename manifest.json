@@ -1,0 +1,13 @@
+{
+  "id": "gst_processor",
+  "name": "GST Processor & Consolidator",
+  "version": "1.0.0",
+  "author": "Vishwas Upponi",
+  "category": "TAX & GST",
+  "entrypoint": "entrypoint.py",
+  "entry_class": "GSTProcessorModule",
+  "ui_page": "web_ui/gst_processor.html",
+  "page_key": "gst_processor",
+  "description": "Organizes GST returns and generates consolidated multi-sheet reconciliation workbooks (GSTR-1, GSTR-3B, Outward Reconciliation).",
+  "dependencies": ["openpyxl>=3.1.0", "pypdf>=3.0.0"]
+}
