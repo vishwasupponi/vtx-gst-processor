@@ -1,0 +1,585 @@
+import os
+import sys
+import re
+from typing import List, Dict, Any, Optional
+import openpyxl
+from openpyxl.cell.cell import MergedCell
+
+try:
+    from services.gstr1_pdf_parser import GSTR1PDFParser
+    from services.gstr3b_pdf_parser import GSTR3BPDFParser
+    from services.gstr1_consolidator import GSTR1ExcelConsolidator
+    from services.template_asset import get_embedded_template_stream, resolve_template_path
+except ImportError:
+    from gstr1_pdf_parser import GSTR1PDFParser
+    from gstr3b_pdf_parser import GSTR3BPDFParser
+    from gstr1_consolidator import GSTR1ExcelConsolidator
+    from template_asset import get_embedded_template_stream, resolve_template_path
+
+
+class MasterReportConsolidator:
+    """Creates a unified multi-sheet Excel workbook containing GSTR 1, GSTR 3B, and Outward Reconciliation."""
+
+    MONTH_LIST = [
+        "April", "May", "June", "July", "August", "September",
+        "October", "November", "December", "January", "February", "March"
+    ]
+
+    def __init__(self, log_callback=None):
+        self.g1_parser = GSTR1PDFParser(log_callback=log_callback)
+        self.g3b_parser = GSTR3BPDFParser(log_callback=log_callback)
+        self.g1_consolidator = GSTR1ExcelConsolidator(log_callback=log_callback)
+        self.log_callback = log_callback
+
+    def log(self, msg: str):
+        if self.log_callback:
+            self.log_callback(msg)
+
+    def _set(self, ws, row: int, col: int, val: Any):
+        """Safely writes to a cell, ignoring merged non-top-left child cells."""
+        cell = ws.cell(row, col)
+        if not isinstance(cell, MergedCell):
+            cell.value = val
+
+    def generate_consolidated_report(
+        self,
+        g1_pdf_paths: List[str],
+        g3b_pdf_paths: List[str],
+        output_filepath: str,
+        progress_callback=None
+    ) -> Dict[str, Any]:
+        """
+        Processes GSTR-1 and GSTR-3B PDFs and creates a unified multi-sheet workbook
+        with 3 sheets: 'GSTR 1', 'GSTR 3B', and 'Outward Reconciliation'.
+        """
+        self.log(f"[Unified Consolidator] Starting Master Consolidation...")
+        self.log(f"   • GSTR-1 PDF returns found: {len(g1_pdf_paths)}")
+        self.log(f"   • GSTR-3B PDF returns found: {len(g3b_pdf_paths)}")
+
+        # ─── Load Master Template (Disk or In-Memory Protected Stream) ────────
+        master_template_file = resolve_template_path("Consolidated Report Format.xlsx")
+        if master_template_file and os.path.exists(master_template_file):
+            self.log(f"   • Loading Master Template from: {master_template_file}")
+            wb_final = openpyxl.load_workbook(master_template_file)
+        elif get_embedded_template_stream is not None:
+            self.log(f"   • Loading Master Template from protected in-memory asset")
+            wb_final = openpyxl.load_workbook(get_embedded_template_stream())
+        else:
+            raise FileNotFoundError("Master template could not be found on disk or in embedded asset.")
+
+        # ─── 1. Populate GSTR 1 Sheet ─────────────────────────────────────────
+        ws_g1 = wb_final['GSTR 1'] if 'GSTR 1' in wb_final.sheetnames else wb_final.active
+        ws_g1.title = "GSTR 1"
+        g1_res = self._populate_gstr1_sheet(ws_g1, g1_pdf_paths, progress_callback)
+
+        # ─── 2. Populate GSTR 3B Sheet ────────────────────────────────────────
+        if 'GSTR 3B' in wb_final.sheetnames:
+            ws_g3b = wb_final['GSTR 3B']
+        else:
+            ws_g3b = wb_final.create_sheet(title="GSTR 3B")
+        g3b_res = self._populate_gstr3b_sheet(ws_g3b, g3b_pdf_paths, progress_callback)
+
+        # ─── 3. Clean and Verify Outward Reconciliation Sheet ─────────────────
+        if 'Outward Reconciliation' in wb_final.sheetnames:
+            ws_recon = wb_final['Outward Reconciliation']
+            self._clean_google_sheets_errors_only(ws_recon)
+
+        # ─── 4. Set GSTR 1 as Only Active/Selected Sheet and Clear Tab Colors ─
+        for i, ws_item in enumerate(wb_final.worksheets):
+            ws_item.sheet_properties.tabColor = None
+            if hasattr(ws_item, "sheet_view"):
+                ws_item.sheet_view.tabSelected = (i == 0)
+            if hasattr(ws_item, "views") and ws_item.views.sheetView:
+                for sv in ws_item.views.sheetView:
+                    sv.tabSelected = (i == 0)
+
+        if 'GSTR 1' in wb_final.sheetnames:
+            wb_final.active = wb_final['GSTR 1']
+
+        # ─── 5. Authorship Metadata ───────────────────────────────────────────
+        try:
+            from utils import apply_workbook_watermark
+            apply_workbook_watermark(wb_final)
+        except Exception:
+            wb_final.properties.creator = "Vishwas Upponi"
+            wb_final.properties.lastModifiedBy = "Vishwas Upponi"
+            wb_final.properties.title = "Vertex Data Export"
+            wb_final.properties.subject = "Author: Vishwas Upponi"
+            wb_final.properties.description = "Generated by Vertex — Author: Vishwas Upponi"
+            wb_final.properties.category = "Vertex"
+
+        # ─── 6. Save Final Unified Report ─────────────────────────────────────
+        os.makedirs(os.path.dirname(os.path.abspath(output_filepath)), exist_ok=True)
+        wb_final.save(output_filepath)
+        wb_final.close()
+
+        self.log(f"[Unified Consolidator] Master Consolidated Report saved successfully:\n{output_filepath}")
+
+        return {
+            "output_file": output_filepath,
+            "gstr1": g1_res,
+            "gstr3b": g3b_res,
+            "sheets": wb_final.sheetnames if hasattr(wb_final, "sheetnames") else ["GSTR 1", "GSTR 3B", "Outward Reconciliation"]
+        }
+
+    def _copy_sheet_structure(self, src_ws, dst_ws, hide_col_a: bool = False):
+        """Copies cells, values, formulas, borders, fonts, fills, alignments, widths, heights, and merged ranges."""
+        for row in src_ws.iter_rows():
+            for cell in row:
+                dst_cell = dst_ws.cell(row=cell.row, column=cell.column)
+                dst_cell.value = cell.value
+
+                if cell.has_style:
+                    # 1. Fonts
+                    if cell.font:
+                        dst_cell.font = openpyxl.styles.Font(
+                            name=cell.font.name,
+                            size=cell.font.size,
+                            bold=cell.font.bold,
+                            italic=cell.font.italic,
+                            color=cell.font.color
+                        )
+                    # 2. Fills
+                    if cell.fill and cell.fill.fill_type:
+                        dst_cell.fill = openpyxl.styles.PatternFill(
+                            fill_type=cell.fill.fill_type,
+                            start_color=cell.fill.start_color,
+                            end_color=cell.fill.end_color
+                        )
+                    # 3. Alignments
+                    if cell.alignment:
+                        dst_cell.alignment = openpyxl.styles.Alignment(
+                            horizontal=cell.alignment.horizontal,
+                            vertical=cell.alignment.vertical,
+                            wrap_text=cell.alignment.wrap_text
+                        )
+                    # 4. Number format
+                    dst_cell.number_format = cell.number_format
+                    # 5. Full Border Preservation
+                    if cell.border:
+                        dst_cell.border = openpyxl.styles.Border(
+                            left=cell.border.left,
+                            right=cell.border.right,
+                            top=cell.border.top,
+                            bottom=cell.border.bottom,
+                            diagonal=cell.border.diagonal,
+                            diagonal_direction=cell.border.diagonal_direction,
+                            outline=cell.border.outline,
+                            vertical=cell.border.vertical,
+                            horizontal=cell.border.horizontal
+                        )
+
+        # 2. Copy merged ranges
+        for mr in src_ws.merged_cells.ranges:
+            try:
+                dst_ws.merge_cells(str(mr))
+            except Exception:
+                pass
+
+        # 3. Copy column dimensions
+        for col_letter, dim in src_ws.column_dimensions.items():
+            dst_ws.column_dimensions[col_letter].width = dim.width
+            dst_ws.column_dimensions[col_letter].hidden = dim.hidden
+
+        if hide_col_a:
+            dst_ws.column_dimensions['A'].hidden = True
+
+        # 4. Copy row dimensions
+        for row_idx, dim in src_ws.row_dimensions.items():
+            dst_ws.row_dimensions[row_idx].height = dim.height
+
+    def _populate_gstr1_sheet(self, ws, pdf_paths: List[str], progress_callback=None) -> Dict[str, Any]:
+        """Populates the GSTR 1 sheet preserving all 2504 formulas, merges, and borders."""
+        parsed_months: Dict[str, Dict[str, Any]] = {}
+        primary_meta = {"gstin": "", "legal_name": "", "trade_name": "", "financial_year": ""}
+
+        for idx, p in enumerate(pdf_paths, 1):
+            data = self.g1_parser.parse_pdf(p)
+            m_name = data.get("month_name", "")
+            if m_name in self.MONTH_LIST:
+                parsed_months[m_name] = data
+                self.log(f"   [GSTR-1 Parsed] {m_name} -> {os.path.basename(p)}")
+
+            if not primary_meta["gstin"] and data.get("gstin"):
+                primary_meta["gstin"] = data["gstin"]
+            if not primary_meta["legal_name"] and data.get("legal_name"):
+                primary_meta["legal_name"] = data["legal_name"]
+            if not primary_meta["trade_name"] and data.get("trade_name"):
+                primary_meta["trade_name"] = data["trade_name"]
+            if not primary_meta["financial_year"] and data.get("financial_year"):
+                primary_meta["financial_year"] = data["financial_year"]
+
+            if progress_callback:
+                progress_callback(idx, len(pdf_paths) + 1, f"GSTR-1: {os.path.basename(p)}")
+
+        # Convert IFERROR formulas and clean #REF!
+        self.g1_consolidator._clean_all_iferror_and_ref_formulas(ws)
+
+        # Merge B2:C2, B3:C3, B4:C4 for labels
+        for r_m in ["B2:C2", "B3:C3", "B4:C4"]:
+            try:
+                ws.merge_cells(r_m)
+            except Exception:
+                pass
+
+        self._set(ws, 1, 3, None)
+        self._set(ws, 2, 3, None)
+        self._set(ws, 3, 3, None)
+        self._set(ws, 4, 3, None)
+
+        if primary_meta["gstin"]:
+            self._set(ws, 2, 4, primary_meta["gstin"])
+        if primary_meta["legal_name"]:
+            self._set(ws, 3, 4, primary_meta["legal_name"])
+        if primary_meta["trade_name"]:
+            self._set(ws, 4, 4, primary_meta["trade_name"])
+
+        # Clear old template dummy values (only numerical cells, preserving formulas)
+        self.g1_consolidator._clear_template_month_rows(ws)
+
+        # Populate months
+        for m_idx, month_name in enumerate(self.MONTH_LIST):
+            if month_name in parsed_months:
+                m_data = parsed_months[month_name]
+                self.g1_consolidator._populate_month_row(ws, m_idx, m_data)
+
+        return {"months_populated": len(parsed_months), "months": list(parsed_months.keys()), "meta": primary_meta}
+
+    def _populate_gstr3b_sheet(self, ws, pdf_paths: List[str], progress_callback=None) -> Dict[str, Any]:
+        """Populates the GSTR 3B sheet preserving all 214 user template formulas, borders, and Table 6.1."""
+        parsed_months: Dict[str, Dict[str, Any]] = {}
+        primary_meta = {"gstin": "", "legal_name": "", "trade_name": "", "financial_year": ""}
+
+        for idx, p in enumerate(pdf_paths, 1):
+            data = self.g3b_parser.parse_pdf(p)
+            if not data:
+                continue
+            m_name = data.get("month_name", "")
+            if m_name in self.MONTH_LIST:
+                parsed_months[m_name] = data
+                self.log(f"   [GSTR-3B Parsed] {m_name} -> {os.path.basename(p)}")
+
+            if not primary_meta["gstin"] and data.get("gstin"):
+                primary_meta["gstin"] = data["gstin"]
+            if not primary_meta["legal_name"] and data.get("legal_name"):
+                primary_meta["legal_name"] = data["legal_name"]
+            if not primary_meta["trade_name"] and data.get("trade_name"):
+                primary_meta["trade_name"] = data["trade_name"]
+            if not primary_meta["financial_year"] and data.get("financial_year"):
+                primary_meta["financial_year"] = data["financial_year"]
+
+            if progress_callback:
+                progress_callback(idx, len(pdf_paths) + 1, f"GSTR-3B: {os.path.basename(p)}")
+
+        # Clean only Google Sheets IFERROR / #REF! errors, preserving user formulas
+        self._clean_google_sheets_errors_only(ws)
+
+        # Write Top Metadata into C1, C2, C3, C4
+        if primary_meta["gstin"]:
+            self._set(ws, 1, 3, primary_meta["gstin"])
+        if primary_meta["legal_name"]:
+            self._set(ws, 2, 3, primary_meta["legal_name"])
+        if primary_meta["trade_name"]:
+            self._set(ws, 3, 3, primary_meta["trade_name"])
+        if primary_meta["financial_year"]:
+            self._set(ws, 4, 3, primary_meta["financial_year"])
+
+        # Clear old template numbers in month rows (only cells without genuine formulas)
+        self._clear_gstr3b_month_rows(ws)
+
+        # Populate static clean month labels across all tables for all 12 constant months
+        self._populate_gstr3b_month_labels(ws)
+
+        # Populate month-by-month table data & Table 6.1 Payment of tax
+        for m_idx, month_name in enumerate(self.MONTH_LIST):
+            if month_name in parsed_months:
+                m_data = parsed_months[month_name]
+                self._populate_gstr3b_month_row(ws, m_idx, m_data)
+
+        # Apply generous professional column widths to GSTR 3B
+        self._apply_gstr3b_column_widths(ws)
+
+        return {"months_populated": len(parsed_months), "months": list(parsed_months.keys()), "meta": primary_meta}
+
+    def _populate_gstr3b_month_labels(self, ws):
+        """Populates clean static month names across all table sections for the constant 12-month year."""
+        for m_idx, month_name in enumerate(self.MONTH_LIST):
+            # Table 3.1 (Rows 7 to 18, Col B)
+            self._set(ws, 7 + m_idx, 2, month_name)
+            # Table 3.1.1 (Rows 23 to 34, Col B)
+            self._set(ws, 23 + m_idx, 2, month_name)
+            # Table 3.2 (Rows 23 to 34, Col N / Col 14)
+            self._set(ws, 23 + m_idx, 14, month_name)
+            # Table 4 Available (Rows 40 to 51, Col B)
+            self._set(ws, 40 + m_idx, 2, month_name)
+            # Table 4 Reversed & Net (Rows 57 to 68, Col B)
+            self._set(ws, 57 + m_idx, 2, month_name)
+            # Table 5 Exempt (Rows 73 to 84, Col B)
+            self._set(ws, 73 + m_idx, 2, month_name)
+            # Table 5.1 Interest (Rows 89 to 100, Col B)
+            self._set(ws, 89 + m_idx, 2, month_name)
+            # Breakup (Rows 105 to 116, Col B)
+            self._set(ws, 105 + m_idx, 2, month_name)
+            # ARN (Rows 120 to 131, Col B)
+            self._set(ws, 120 + m_idx, 2, month_name)
+            # Table 6.1 (Payment of tax) Month Header in Col AH (Col 34)
+            self._set(ws, 5 + (m_idx * 11), 34, month_name)
+
+    def _apply_gstr3b_column_widths(self, ws):
+        """Applies generous, professional column widths so no header or value is cramped or clipped."""
+        widths_map = {
+            'A': 6,
+            'B': 14,
+            'C': 20, 'D': 16, 'E': 16, 'F': 16, 'G': 14,
+            'H': 20, 'I': 16, 'J': 16, 'K': 16, 'L': 14,
+            'M': 20, 'N': 16, 'O': 20, 'P': 16, 'Q': 20,
+            'R': 20, 'S': 20, 'T': 16, 'U': 16, 'V': 16,
+            'W': 20, 'X': 16, 'Y': 16, 'Z': 16, 'AA': 14,
+            'AB': 22, 'AC': 20, 'AD': 20, 'AE': 20, 'AF': 20,
+            'AG': 6,
+            'AH': 16, 'AI': 34, 'AJ': 18, 'AK': 30, 'AL': 20,
+            'AM': 18, 'AN': 18, 'AO': 18, 'AP': 16,
+            'AQ': 20, 'AR': 20, 'AS': 20
+        }
+        for col_letter, width in widths_map.items():
+            ws.column_dimensions[col_letter].width = width
+        # Ensure Column A is hidden
+        ws.column_dimensions['A'].hidden = True
+
+    def _clean_google_sheets_errors_only(self, ws):
+        """Cleans only =IFERROR(...) Google Sheets dummy wrappers and =#REF!, preserving user formulas."""
+        for row in ws.iter_rows():
+            for cell in row:
+                if isinstance(cell, MergedCell):
+                    continue
+                val = cell.value
+                if val and isinstance(val, str):
+                    if "#REF!" in val:
+                        cell.value = None
+                    elif "xludf" in val or "DUMMYFUNCTION" in val:
+                        cell.value = self.g1_consolidator._extract_iferror_fallback(val)
+
+    def _clear_gstr3b_month_rows(self, ws):
+        """Clears dummy values from GSTR-3B month rows, preserving user formulas."""
+        table_ranges = [
+            (7, 18),   # Table 3.1
+            (23, 34),  # Table 3.1.1 & 3.2
+            (40, 51),  # Table 4 Available
+            (57, 68),  # Table 4 Reversed & Net
+            (73, 84),  # Table 5 Exempt
+            (89, 100), # Table 5.1 Interest & Late Fee
+            (105, 116),# Breakup of Tax Liability
+            (120, 131) # ARN Info
+        ]
+        for start_r, end_r in table_ranges:
+            for r in range(start_r, end_r + 1):
+                for c in range(3, 30):
+                    cell = ws.cell(r, c)
+                    # Only clear if cell does not contain a formula
+                    if cell.value is not None and isinstance(cell.value, str) and cell.value.startswith("="):
+                        continue
+                    self._set(ws, r, c, None)
+
+    def _populate_gstr3b_month_row(self, ws, m_idx: int, m_data: Dict[str, Any]):
+        """Populates all table numbers, ARN details, and Table 6.1 for a given month in GSTR-3B."""
+        t = m_data.get("tables", m_data)
+
+        # ─── Table 3.1 (Rows 7 to 18) ─────────────────────────────────────────
+        r31 = 7 + m_idx
+        t31a = t.get("3.1_a", {})
+        t31b = t.get("3.1_b", {})
+        t31c = t.get("3.1_c", {})
+        t31d = t.get("3.1_d", {})
+        t31e = t.get("3.1_e", {})
+
+        # (a) Outward taxable supplies
+        self._set(ws, r31, 3, t31a.get("val", 0.0) or None)      # Col C: Total Taxable Value
+        self._set(ws, r31, 4, t31a.get("igst", 0.0) or None)     # Col D: IGST
+        self._set(ws, r31, 5, t31a.get("cgst", 0.0) or None)     # Col E: CGST
+        self._set(ws, r31, 6, t31a.get("sgst", 0.0) or None)     # Col F: SGST
+        self._set(ws, r31, 7, t31a.get("cess", 0.0) or None)     # Col G: Cess
+
+        # (b) Zero rated
+        self._set(ws, r31, 8, t31b.get("val", 0.0) or None)      # Col H: Value
+        self._set(ws, r31, 9, t31b.get("igst", 0.0) or None)     # Col I: IGST
+        self._set(ws, r31, 12, t31b.get("cess", 0.0) or None)    # Col L: Cess
+
+        # (c) Other outward supplies (nil, exempt)
+        self._set(ws, r31, 13, t31c.get("val", 0.0) or None)     # Col M: Value
+
+        # (d) Inward reverse charge
+        self._set(ws, r31, 18, t31d.get("val", 0.0) or None)     # Col R: Value
+        self._set(ws, r31, 19, t31d.get("igst", 0.0) or None)    # Col S: IGST
+        self._set(ws, r31, 20, t31d.get("cgst", 0.0) or None)    # Col T: CGST
+        self._set(ws, r31, 21, t31d.get("sgst", 0.0) or None)    # Col U: SGST
+        self._set(ws, r31, 22, t31d.get("cess", 0.0) or None)    # Col V: Cess
+
+        # (e) Non-GST outward supplies
+        self._set(ws, r31, 23, t31e.get("val", 0.0) or None)     # Col W: Value
+
+        # ─── Table 3.1.1 & 3.2 (Rows 23 to 34) ────────────────────────────────
+        r311 = 23 + m_idx
+        t311i = t.get("3.1.1_i", {})
+        t311ii = t.get("3.1.1_ii", {})
+        t32u = t.get("3.2_unregistered", {})
+        t32c = t.get("3.2_composition", {})
+        t32uin = t.get("3.2_uin", {})
+
+        # 3.1.1(i) ECO pays tax
+        self._set(ws, r311, 3, t311i.get("val", 0.0) or None)    # Col C: Value
+        self._set(ws, r311, 4, t311i.get("igst", 0.0) or None)   # Col D: IGST
+        self._set(ws, r311, 5, t311i.get("cgst", 0.0) or None)   # Col E: CGST
+        self._set(ws, r311, 6, t311i.get("sgst", 0.0) or None)   # Col F: SGST
+        self._set(ws, r311, 7, t311i.get("cess", 0.0) or None)   # Col G: Cess
+
+        # 3.1.1(ii) Registered person through ECO
+        self._set(ws, r311, 8, t311ii.get("val", 0.0) or None)   # Col H: Value
+
+        # 3.2 Inter-state supplies
+        self._set(ws, r311, 15, t32u.get("val", 0.0) or None)    # Col O: Unregistered Value
+        self._set(ws, r311, 16, t32u.get("igst", 0.0) or None)   # Col P: Unregistered IGST
+        self._set(ws, r311, 17, t32c.get("val", 0.0) or None)    # Col Q: Composition Value
+        self._set(ws, r311, 18, t32c.get("igst", 0.0) or None)   # Col R: Composition IGST
+        self._set(ws, r311, 19, t32uin.get("val", 0.0) or None)  # Col S: UIN Value
+        self._set(ws, r311, 20, t32uin.get("igst", 0.0) or None) # Col T: UIN IGST
+
+        # ─── Table 4 Available (Rows 40 to 51) ────────────────────────────────
+        r4a = 40 + m_idx
+        t4a1 = t.get("4_A_1_goods", {})
+        t4a2 = t.get("4_A_2_services", {})
+        t4a3 = t.get("4_A_3_reverse_charge", {})
+        t4a4 = t.get("4_A_4_isd", {})
+        t4a5 = t.get("4_A_5_all_other", {})
+
+        # (1) Import of goods
+        self._set(ws, r4a, 3, t4a1.get("igst", 0.0) or None)     # Col C: IGST
+        self._set(ws, r4a, 6, t4a1.get("cess", 0.0) or None)     # Col F: Cess
+
+        # (2) Import of services
+        self._set(ws, r4a, 7, t4a2.get("igst", 0.0) or None)     # Col G: IGST
+        self._set(ws, r4a, 10, t4a2.get("cess", 0.0) or None)    # Col J: Cess
+
+        # (3) Inward reverse charge
+        self._set(ws, r4a, 11, t4a3.get("igst", 0.0) or None)    # Col K: IGST
+        self._set(ws, r4a, 12, t4a3.get("cgst", 0.0) or None)    # Col L: CGST
+        self._set(ws, r4a, 13, t4a3.get("sgst", 0.0) or None)    # Col M: SGST
+        self._set(ws, r4a, 14, t4a3.get("cess", 0.0) or None)    # Col N: Cess
+
+        # (4) Inward ISD
+        self._set(ws, r4a, 15, t4a4.get("igst", 0.0) or None)    # Col O: IGST
+        self._set(ws, r4a, 16, t4a4.get("cgst", 0.0) or None)    # Col P: CGST
+        self._set(ws, r4a, 17, t4a4.get("sgst", 0.0) or None)    # Col Q: SGST
+        self._set(ws, r4a, 18, t4a4.get("cess", 0.0) or None)    # Col R: Cess
+
+        # (5) All other ITC
+        self._set(ws, r4a, 19, t4a5.get("igst", 0.0) or None)    # Col S: IGST
+        self._set(ws, r4a, 20, t4a5.get("cgst", 0.0) or None)    # Col T: CGST
+        self._set(ws, r4a, 21, t4a5.get("sgst", 0.0) or None)    # Col U: SGST
+        self._set(ws, r4a, 22, t4a5.get("cess", 0.0) or None)    # Col V: Cess
+
+        # ─── Table 4 Reversed & Net (Rows 57 to 68) ───────────────────────────
+        r4bc = 57 + m_idx
+        t4b1 = t.get("4_B_1_rules", {})
+        t4b2 = t.get("4_B_2_others", {})
+        t4d1 = t.get("4_D_1_reclaimed", {})
+        t4d2 = t.get("4_D_2_ineligible", {})
+
+        # B(1) Rules 38, 42 & 43
+        self._set(ws, r4bc, 3, t4b1.get("igst", 0.0) or None)    # Col C: IGST
+        self._set(ws, r4bc, 4, t4b1.get("cgst", 0.0) or None)    # Col D: CGST
+        self._set(ws, r4bc, 5, t4b1.get("sgst", 0.0) or None)    # Col E: SGST
+        self._set(ws, r4bc, 6, t4b1.get("cess", 0.0) or None)    # Col F: Cess
+
+        # B(2) Others
+        self._set(ws, r4bc, 7, t4b2.get("igst", 0.0) or None)    # Col G: IGST
+        self._set(ws, r4bc, 8, t4b2.get("cgst", 0.0) or None)    # Col H: CGST
+        self._set(ws, r4bc, 9, t4b2.get("sgst", 0.0) or None)    # Col I: SGST
+        self._set(ws, r4bc, 10, t4b2.get("cess", 0.0) or None)   # Col J: Cess
+
+        # D(1) Reclaimed
+        self._set(ws, r4bc, 12, t4d1.get("igst", 0.0) or None)   # Col L: IGST
+        self._set(ws, r4bc, 13, t4d1.get("cgst", 0.0) or None)   # Col M: CGST
+        self._set(ws, r4bc, 14, t4d1.get("sgst", 0.0) or None)   # Col N: SGST
+        self._set(ws, r4bc, 15, t4d1.get("cess", 0.0) or None)   # Col O: Cess
+
+        # D(2) Ineligible
+        self._set(ws, r4bc, 16, t4d2.get("igst", 0.0) or None)   # Col P: IGST
+        self._set(ws, r4bc, 17, t4d2.get("cgst", 0.0) or None)   # Col Q: CGST
+        self._set(ws, r4bc, 18, t4d2.get("sgst", 0.0) or None)   # Col R: SGST
+        self._set(ws, r4bc, 19, t4d2.get("cess", 0.0) or None)   # Col S: Cess
+
+        # ─── Table 5 Exempt (Rows 73 to 84) ───────────────────────────────────
+        r5e = 73 + m_idx
+        t5en = t.get("5_exempt_nil", {})
+        t5ng = t.get("5_non_gst", {})
+
+        self._set(ws, r5e, 3, t5en.get("inter", 0.0) or None)    # Col C: Inter-State
+        self._set(ws, r5e, 4, t5en.get("intra", 0.0) or None)    # Col D: Intra-State
+        self._set(ws, r5e, 5, t5ng.get("inter", 0.0) or None)    # Col E: Non-GST Inter
+        self._set(ws, r5e, 6, t5ng.get("intra", 0.0) or None)    # Col F: Non-GST Intra
+
+        # ─── Table 5.1 Interest & Late Fee (Rows 89 to 100) ───────────────────
+        r51 = 89 + m_idx
+        t51i = t.get("5.1_interest_paid", {})
+        t51lf = t.get("5.1_late_fee", {})
+
+        # Interest Paid
+        self._set(ws, r51, 7, t51i.get("igst", 0.0) or None)     # Col G: IGST
+        self._set(ws, r51, 8, t51i.get("cgst", 0.0) or None)     # Col H: CGST
+        self._set(ws, r51, 9, t51i.get("sgst", 0.0) or None)     # Col I: SGST
+        self._set(ws, r51, 10, t51i.get("cess", 0.0) or None)    # Col J: Cess
+
+        # Late Fee Paid
+        self._set(ws, r51, 12, t51lf.get("cgst", 0.0) or None)   # Col L: CGST
+        self._set(ws, r51, 13, t51lf.get("sgst", 0.0) or None)   # Col M: SGST
+
+        # ─── Breakup of Tax Liability (Rows 105 to 116) ───────────────────────
+        r_brk = 105 + m_idx
+        t_brk = t.get("breakup_tax_liability", {})
+        self._set(ws, r_brk, 4, t_brk.get("igst", 0.0) or None)  # Col D: IGST
+        self._set(ws, r_brk, 5, t_brk.get("cgst", 0.0) or None)  # Col E: CGST
+        self._set(ws, r_brk, 6, t_brk.get("sgst", 0.0) or None)  # Col F: SGST
+        self._set(ws, r_brk, 7, t_brk.get("cess", 0.0) or None)  # Col G: Cess
+
+        # ─── Table 6.1 Payment of Tax (Columns AJ to AS / Cols 36 to 45) ───────
+        # Base row: April=5, May=16, June=27, July=38, etc.
+        base_61 = 5 + (m_idx * 11)
+        t61 = t.get("6.1_payment", {})
+        a_igst = t61.get("A_integrated", {})
+        a_cgst = t61.get("A_central", {})
+        a_sgst = t61.get("A_state", {})
+        a_cess = t61.get("A_cess", {})
+        b_igst = t61.get("B_integrated", {})
+        b_cgst = t61.get("B_central", {})
+        b_sgst = t61.get("B_state", {})
+        b_cess = t61.get("B_cess", {})
+
+        def _write_61_row(row_num: int, d: Dict[str, Any]):
+            self._set(ws, row_num, 36, d.get("tax_payable", 0.0) or None) # AJ: Tax payable
+            self._set(ws, row_num, 37, d.get("adj_negative", 0.0) or None)# AK: Adj negative
+            self._set(ws, row_num, 38, d.get("net_payable", 0.0) or None) # AL: Net payable
+            self._set(ws, row_num, 39, d.get("itc_igst", 0.0) or None)    # AM: ITC Integrated
+            self._set(ws, row_num, 40, d.get("itc_cgst", 0.0) or None)    # AN: ITC Central
+            self._set(ws, row_num, 41, d.get("itc_sgst", 0.0) or None)    # AO: ITC State/UT
+            self._set(ws, row_num, 42, d.get("itc_cess", 0.0) or None)    # AP: ITC Cess
+            self._set(ws, row_num, 43, d.get("cash_paid", 0.0) or None)   # AQ: Cash paid
+            self._set(ws, row_num, 44, d.get("interest", 0.0) or None)    # AR: Interest
+            self._set(ws, row_num, 45, d.get("late_fee", 0.0) or None)    # AS: Late fee
+
+        # (A) Other than reverse charge (Rows base+1 to base+4)
+        _write_61_row(base_61 + 1, a_igst) # Row 6 for April: Integrated
+        _write_61_row(base_61 + 2, a_cgst) # Row 7 for April: Central
+        _write_61_row(base_61 + 3, a_sgst) # Row 8 for April: State/UT
+        _write_61_row(base_61 + 4, a_cess) # Row 9 for April: Cess
+
+        # (B) Reverse charge (Rows base+6 to base+9)
+        _write_61_row(base_61 + 6, b_igst) # Row 11 for April: Integrated
+        _write_61_row(base_61 + 7, b_cgst) # Row 12 for April: Central
+        _write_61_row(base_61 + 8, b_sgst) # Row 13 for April: State/UT
+        _write_61_row(base_61 + 9, b_cess) # Row 14 for April: Cess
+
+        # ─── ARN Table (Rows 120 to 131) ──────────────────────────────────────
+        r_arn = 120 + m_idx
+        self._set(ws, r_arn, 2, self.MONTH_LIST[m_idx])                   # Col B: Month
+        self._set(ws, r_arn, 3, m_data.get("arn") or None)                # Col C: ARN
+        self._set(ws, r_arn, 4, m_data.get("arn_date") or None)           # Col D: Date of ARN

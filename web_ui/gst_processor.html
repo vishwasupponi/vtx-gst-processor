@@ -1,0 +1,379 @@
+<div class="module-view-container">
+  <!-- Title Section -->
+  <div class="module-view-header">
+    <h1 class="module-view-title">GST PROCESSOR & CONSOLIDATOR</h1>
+    <a href="javascript:void(0)" class="module-instructions-link" onclick="openInstructions()">
+      📖 Click here to view the Instructions
+    </a>
+  </div>
+
+  <!-- 1. Source & Destination Selection Card -->
+  <div class="original-card module-section-card">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+      <h3 style="font-size: 18px; font-weight: 700; color: var(--accent); margin: 0;">Source & Destination Selection</h3>
+      <div class="notif-segmented-tabs" style="margin: 0;">
+        <button class="seg-tab active" id="seg-folder" onclick="setGstProcMode('folder')">📁 Entire Folder</button>
+        <button class="seg-tab" id="seg-files" onclick="setGstProcMode('files')">📄 Specific Files</button>
+      </div>
+    </div>
+
+    <!-- Source Input Row -->
+    <div class="form-field-row" style="margin-bottom: 14px;">
+      <label id="lbl-source" class="form-field-label">Source Folder (Returns Dump / PDFs / Excels / JSONs):</label>
+      <div style="display: flex; gap: 10px; width: 100%;">
+        <input type="text" id="gst-src-path" class="module-input" placeholder="Select folder containing unorganized GST return files..." style="flex:1;" oninput="onSrcChanged(this.value)" />
+        <button id="btn-browse-src" class="btn-pill btn-pill-secondary btn-compact" onclick="browseSource()">Browse</button>
+      </div>
+    </div>
+
+    <!-- Destination Input Row -->
+    <div class="form-field-row">
+      <label class="form-field-label">Destination Folder (Organized Returns & Output):</label>
+      <div style="display: flex; gap: 10px; width: 100%;">
+        <input type="text" id="gst-dest-path" class="module-input" placeholder="Select destination folder (defaults to Source/Organized_GST_Returns)..." style="flex:1;" oninput="onDestChanged(this.value)" />
+        <button id="btn-browse-dest" class="btn-pill btn-pill-secondary btn-compact" onclick="browseDest()">Browse</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Processing & Organization Options Card -->
+  <div class="original-card module-section-card">
+    <h3 style="font-size: 18px; font-weight: 700; color: var(--accent); margin: 0 0 16px 0;">Processing & Organization Options</h3>
+    <div style="display: flex; flex-direction: column; gap: 12px;">
+      <label class="custom-chk-row">
+        <input type="checkbox" id="chk-task-master" checked onchange="onTaskOptionChanged('master_report', this.checked)" />
+        <span class="m3-checkbox"></span>
+        <span class="chk-label-bold">Generate GSTR-1 & 3B Consolidated Report (GSTR 1, GSTR 3B, Outward Reconciliation)</span>
+      </label>
+      <label class="custom-chk-row">
+        <input type="checkbox" id="chk-task-2a" checked onchange="onTaskOptionChanged('gstr2a', this.checked)" />
+        <span class="m3-checkbox"></span>
+        <span class="chk-label-bold">Consolidate GSTR-2A Returns</span>
+      </label>
+      <label class="custom-chk-row">
+        <input type="checkbox" id="chk-task-2b" checked onchange="onTaskOptionChanged('gstr2b', this.checked)" />
+        <span class="m3-checkbox"></span>
+        <span class="chk-label-bold">Consolidate GSTR-2B Returns</span>
+      </label>
+      <label class="custom-chk-row">
+        <input type="checkbox" id="chk-task-organize" checked onchange="onTaskOptionChanged('organize', this.checked)" />
+        <span class="m3-checkbox"></span>
+        <span class="chk-label-bold">Organize & Sort Files into GSTR Folders (GSTR-1, GSTR-2A, GSTR-2B, GSTR-3B)</span>
+      </label>
+    </div>
+  </div>
+
+  <!-- 3. Action Card Container -->
+  <div class="original-card module-section-card" style="margin-top: 16px;">
+    <!-- Action Buttons Row -->
+    <div style="display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; margin-bottom: 14px;">
+      <button id="btn-start-gst-proc" class="module-btn-run" style="flex: 1; min-width: 280px;" onclick="startGstProcessing()">
+        Start Processing & Generate Reports
+      </button>
+      <button id="btn-open-folder" class="btn-pill btn-pill-secondary" style="height: 44px; border-radius: 22px; padding: 0 20px;" disabled onclick="openOutputFolder()">
+        📂 Open Folder
+      </button>
+      <button id="btn-reset-gst" class="btn-pill btn-pill-secondary" style="height: 44px; border-radius: 22px; padding: 0 20px;" onclick="resetGstProcessor()">
+        🔄 Reset
+      </button>
+    </div>
+
+    <!-- Progress Bar Track -->
+    <div style="width: 100%; height: 10px; border-radius: 5px; background: var(--bg-card); border: 1px solid var(--border-card); overflow: hidden; padding: 1px; box-sizing: border-box;">
+      <div id="gst-proc-progress-bar" style="width: 0%; height: 100%; border-radius: 4px; background: var(--accent); box-shadow: 0 0 10px var(--accent-glow); transition: width 0.3s ease;"></div>
+    </div>
+
+    <!-- Status Label -->
+    <div id="gst-proc-status" style="font-size: 14px; color: var(--text-secondary); text-align: center; margin-top: 10px;">
+      Ready to process GST returns. Check System Logs for details.
+    </div>
+  </div>
+</div>
+
+<script>
+// Global Progress Callback attached to window (persists across tab navigation)
+window.onGstProcProgress = function(pct, msg) {
+  if (window.VERTEX_STATE && window.VERTEX_STATE.gst_processor) {
+    const st = window.VERTEX_STATE.gst_processor;
+    st.progressPct = pct;
+    st.statusText = msg;
+    st.statusColor = 'var(--accent)';
+    st.statusHtml = '';
+  }
+  const bar = document.getElementById('gst-proc-progress-bar');
+  const status = document.getElementById('gst-proc-status');
+  if (bar) bar.style.width = pct + '%';
+  if (status) {
+    status.style.color = 'var(--accent)';
+    status.innerText = msg;
+  }
+};
+
+// Global Finish Callback attached to window (persists across tab navigation)
+window.onGstProcFinished = function(success, resultData) {
+  if (window.VERTEX_STATE && window.VERTEX_STATE.gst_processor) {
+    const st = window.VERTEX_STATE.gst_processor;
+    st.isRunning = false;
+    if (success) {
+      st.lastOutputDir = resultData || '';
+      st.progressPct = 100;
+      st.statusColor = '#10B981';
+      st.statusHtml = `✓ GST Processing finished successfully! Output saved in: <strong>${escapeHtml(resultData)}</strong>`;
+      st.statusText = `✓ GST Processing finished successfully! Output saved in: ${resultData}`;
+    } else {
+      st.progressPct = 0;
+      st.statusColor = '#EF4444';
+      st.statusHtml = '';
+      st.statusText = `⚠ Processing Error: ${resultData || 'Unknown error occurred.'}`;
+    }
+  }
+
+  // If user is currently on the GST Processor page, update UI elements directly
+  renderGstProcessorState();
+};
+
+function renderGstProcessorState() {
+  const st = window.VERTEX_STATE ? window.VERTEX_STATE.gst_processor : null;
+  if (!st) return;
+
+  const btnStart = document.getElementById('btn-start-gst-proc');
+  const btnOpen = document.getElementById('btn-open-folder');
+  const btnReset = document.getElementById('btn-reset-gst');
+  const btnBrowseSrc = document.getElementById('btn-browse-src');
+  const btnBrowseDest = document.getElementById('btn-browse-dest');
+  const srcInp = document.getElementById('gst-src-path');
+  const destInp = document.getElementById('gst-dest-path');
+  const bar = document.getElementById('gst-proc-progress-bar');
+  const status = document.getElementById('gst-proc-status');
+
+  const segFolder = document.getElementById('seg-folder');
+  const segFiles = document.getElementById('seg-files');
+  const lblSrc = document.getElementById('lbl-source');
+
+  // Checkboxes
+  const chkMaster = document.getElementById('chk-task-master');
+  const chk2a = document.getElementById('chk-task-2a');
+  const chk2b = document.getElementById('chk-task-2b');
+  const chkOrg = document.getElementById('chk-task-organize');
+
+  if (chkMaster) chkMaster.checked = st.tasks.master_report !== false;
+  if (chk2a) chk2a.checked = st.tasks.gstr2a !== false;
+  if (chk2b) chk2b.checked = st.tasks.gstr2b !== false;
+  if (chkOrg) chkOrg.checked = st.tasks.organize !== false;
+
+  // Mode & Inputs
+  if (segFolder && segFiles && lblSrc && srcInp) {
+    segFolder.classList.toggle('active', st.mode === 'folder');
+    segFiles.classList.toggle('active', st.mode === 'files');
+    if (st.mode === 'folder') {
+      lblSrc.innerText = 'Source Folder (Returns Dump / PDFs / Excels / JSONs):';
+      srcInp.placeholder = 'Select folder containing unorganized GST return files...';
+      srcInp.value = st.srcPath || '';
+    } else {
+      lblSrc.innerText = 'Selected Return Files (PDFs / Excels / ZIPs):';
+      srcInp.placeholder = 'Select one or multiple GST return files (PDFs, Excels, ZIPs)...';
+      srcInp.value = st.selectedFiles && st.selectedFiles.length > 0 
+        ? `(${st.selectedFiles.length} files selected) ${st.selectedFiles[0].split(/[\\\\/]/).pop()}${st.selectedFiles.length > 1 ? '...' : ''}`
+        : '';
+    }
+  }
+
+  if (destInp) destInp.value = st.destPath || '';
+  if (bar) bar.style.width = (st.progressPct || 0) + '%';
+
+  // Status message
+  if (status) {
+    status.style.color = st.statusColor || 'var(--text-secondary)';
+    if (st.statusHtml) {
+      status.innerHTML = st.statusHtml;
+    } else {
+      status.innerText = st.statusText || 'Ready to process GST returns. Check System Logs for details.';
+    }
+  }
+
+  // Lock buttons & inputs while running
+  if (st.isRunning) {
+    if (btnStart) {
+      btnStart.disabled = true;
+      btnStart.innerText = '⏳ Processing GST Returns...';
+    }
+    if (btnOpen) btnOpen.disabled = true;
+    if (btnReset) btnReset.disabled = true;
+    if (btnBrowseSrc) btnBrowseSrc.disabled = true;
+    if (btnBrowseDest) btnBrowseDest.disabled = true;
+    if (srcInp) srcInp.disabled = true;
+    if (destInp) destInp.disabled = true;
+    if (segFolder) segFolder.disabled = true;
+    if (segFiles) segFiles.disabled = true;
+    if (chkMaster) chkMaster.disabled = true;
+    if (chk2a) chk2a.disabled = true;
+    if (chk2b) chk2b.disabled = true;
+    if (chkOrg) chkOrg.disabled = true;
+  } else {
+    if (btnStart) {
+      btnStart.disabled = false;
+      btnStart.innerText = 'Start Processing & Generate Reports';
+    }
+    if (btnOpen) btnOpen.disabled = !st.lastOutputDir;
+    if (btnReset) btnReset.disabled = false;
+    if (btnBrowseSrc) btnBrowseSrc.disabled = false;
+    if (btnBrowseDest) btnBrowseDest.disabled = false;
+    if (srcInp) srcInp.disabled = false;
+    if (destInp) destInp.disabled = false;
+    if (segFolder) segFolder.disabled = false;
+    if (segFiles) segFiles.disabled = false;
+    if (chkMaster) chkMaster.disabled = false;
+    if (chk2a) chk2a.disabled = false;
+    if (chk2b) chk2b.disabled = false;
+    if (chkOrg) chkOrg.disabled = false;
+  }
+}
+
+function setGstProcMode(mode) {
+  const st = window.VERTEX_STATE.gst_processor;
+  if (st.isRunning) return;
+  st.mode = mode;
+  st.srcPath = '';
+  st.selectedFiles = [];
+  renderGstProcessorState();
+}
+
+function onSrcChanged(val) {
+  if (window.VERTEX_STATE && window.VERTEX_STATE.gst_processor) {
+    window.VERTEX_STATE.gst_processor.srcPath = val;
+  }
+}
+
+function onDestChanged(val) {
+  if (window.VERTEX_STATE && window.VERTEX_STATE.gst_processor) {
+    window.VERTEX_STATE.gst_processor.destPath = val;
+  }
+}
+
+function onTaskOptionChanged(taskKey, val) {
+  if (window.VERTEX_STATE && window.VERTEX_STATE.gst_processor) {
+    window.VERTEX_STATE.gst_processor.tasks[taskKey] = val;
+  }
+}
+
+async function browseSource() {
+  const st = window.VERTEX_STATE.gst_processor;
+  if (st.isRunning) return;
+
+  if (st.mode === 'folder') {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.browse_folder_dialog) {
+      const folder = await window.pywebview.api.browse_folder_dialog("Select Source GST Returns Folder");
+      if (folder) {
+        st.srcPath = folder;
+        if (!st.destPath) {
+          st.destPath = folder + "\\Organized_GST_Returns";
+        }
+        renderGstProcessorState();
+      }
+    }
+  } else {
+    if (window.pywebview && window.pywebview.api && window.pywebview.api.pick_gst_processor_files) {
+      const files = await window.pywebview.api.pick_gst_processor_files();
+      if (files && files.length > 0) {
+        st.selectedFiles = files;
+        if (!st.destPath) {
+          const parentDir = files[0].substring(0, files[0].lastIndexOf('\\') || files[0].lastIndexOf('/'));
+          st.destPath = parentDir + "\\Organized_GST_Returns";
+        }
+        renderGstProcessorState();
+      }
+    }
+  }
+}
+
+async function browseDest() {
+  const st = window.VERTEX_STATE.gst_processor;
+  if (st.isRunning) return;
+
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.browse_folder_dialog) {
+    const folder = await window.pywebview.api.browse_folder_dialog("Select Output Reports Destination Folder");
+    if (folder) {
+      st.destPath = folder;
+      renderGstProcessorState();
+    }
+  }
+}
+
+async function startGstProcessing() {
+  const st = window.VERTEX_STATE.gst_processor;
+  if (st.isRunning) return;
+
+  const src = st.mode === 'folder' ? st.srcPath.trim() : '';
+  const dest = st.destPath.trim();
+
+  if (st.mode === 'folder' && !src) {
+    alert("Please select a Source Folder.");
+    return;
+  }
+  if (st.mode === 'files' && (!st.selectedFiles || st.selectedFiles.length === 0)) {
+    alert("Please select at least one GST return file.");
+    return;
+  }
+  if (!dest) {
+    alert("Please specify an Output Directory.");
+    return;
+  }
+
+  // Lock state in global store
+  st.isRunning = true;
+  st.progressPct = 5;
+  st.statusColor = 'var(--accent)';
+  st.statusHtml = '';
+  st.statusText = '⏳ Processing GST returns... Check System Logs for live streaming.';
+  renderGstProcessorState();
+
+  if (window.pywebview && window.pywebview.api && window.pywebview.api.run_gst_processing) {
+    const res = await window.pywebview.api.run_gst_processing(st.mode, src, st.selectedFiles, dest, st.tasks);
+    if (!res || !res.success) {
+      st.isRunning = false;
+      st.progressPct = 0;
+      st.statusColor = '#EF4444';
+      st.statusText = `⚠ Error starting process: ${res ? res.error : 'Unknown'}`;
+      renderGstProcessorState();
+    }
+  }
+}
+
+function openOutputFolder() {
+  const st = window.VERTEX_STATE.gst_processor;
+  const targetDir = st.lastOutputDir || st.destPath;
+  if (targetDir && window.pywebview && window.pywebview.api && window.pywebview.api.open_folder_in_explorer) {
+    window.pywebview.api.open_folder_in_explorer(targetDir);
+  }
+}
+
+function resetGstProcessor() {
+  const st = window.VERTEX_STATE.gst_processor;
+  if (st.isRunning) return;
+
+  st.isRunning = false;
+  st.selectedFiles = [];
+  st.srcPath = '';
+  st.destPath = '';
+  st.lastOutputDir = '';
+  st.progressPct = 0;
+  st.tasks = { master_report: true, gstr2a: true, gstr2b: true, organize: true };
+  st.statusColor = 'var(--text-secondary)';
+  st.statusHtml = '';
+  st.statusText = "Ready to process GST returns. Check System Logs for details.";
+  renderGstProcessorState();
+}
+
+function openInstructions() {
+  if (window.pywebview && window.pywebview.api) {
+    window.pywebview.api.open_instructions('gst_processor');
+  }
+}
+
+function escapeHtml(str) {
+  return (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Initial mount render
+renderGstProcessorState();
+</script>
